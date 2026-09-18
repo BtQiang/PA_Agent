@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from pa_agent.util.threading import CancelToken
 
 from pa_agent.config.settings import AIProviderSettings
+from pa_agent.ai.rate_limit import call_with_rate_limit_backoff, is_rate_limit_error
 from pa_agent.util.mask_secret import mask_secret
 from pa_agent.ai.mimo_compat import (
     ReasoningCache,
@@ -573,10 +574,15 @@ class DeepSeekClient:
         if not _thinking_on:
             create_kwargs["temperature"] = 0
         try:
-            response = client.chat.completions.create(
-                **create_kwargs,
-                # IMPORTANT: do NOT add temperature, top_p, presence_penalty,
-                # frequency_penalty — they are incompatible with thinking mode.
+            response = call_with_rate_limit_backoff(
+                lambda: client.chat.completions.create(
+                    **create_kwargs,
+                    # IMPORTANT: do NOT add temperature, top_p, presence_penalty,
+                    # frequency_penalty — they are incompatible with thinking mode.
+                ),
+                log=self._log,
+                stage_label="DeepSeek",
+                cancel_token=cancel_token,
             )
         except Exception as exc:
             latency_ms = (time.monotonic() - t0) * 1000
@@ -769,13 +775,26 @@ class DeepSeekClient:
             if _effort is not None:
                 stream_kwargs["reasoning_effort"] = _effort
 
-            try:
-                stream = client.chat.completions.create(**stream_kwargs)
-            except Exception:
-                # Retry without stream_options if provider rejects it
-                self._log.debug("stream_options not supported; retrying without it")
-                stream_kwargs.pop("stream_options", None)
-                stream = client.chat.completions.create(**stream_kwargs)
+            def _create_stream() -> Any:
+                try:
+                    return client.chat.completions.create(**stream_kwargs)
+                except Exception as _exc:  # noqa: BLE001
+                    # Rate-limit must bubble up so backoff can retry the same call
+                    # (don't silently downgrade to no-stream_options).
+                    if is_rate_limit_error(_exc):
+                        raise
+                    # Retry without stream_options if provider rejects it
+                    self._log.debug("stream_options not supported; retrying without it")
+                    kwargs_no_so = dict(stream_kwargs)
+                    kwargs_no_so.pop("stream_options", None)
+                    return client.chat.completions.create(**kwargs_no_so)
+
+            stream = call_with_rate_limit_backoff(
+                _create_stream,
+                log=self._log,
+                stage_label="DeepSeek",
+                cancel_token=cancel_token,
+            )
 
             for chunk in stream:
                 # Check cancellation on each chunk
